@@ -1,28 +1,28 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Heavy Web Proxy</title>
+    <title>Enterprise Proxy</title>
     <style>
-        body, html { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1a1a1a; font-family: sans-serif; }
-        .nav { height: 50px; background: #333; display: flex; align-items: center; padding: 0 20px; gap: 10px; }
-        input { flex: 1; padding: 8px; border-radius: 4px; border: none; }
-        button { padding: 8px 15px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        body, html { margin: 0; padding: 0; height: 100%; background: #000; color: white; overflow: hidden; }
+        .bar { height: 50px; background: #222; display: flex; align-items: center; padding: 0 15px; border-bottom: 2px solid #444; }
+        input { flex: 1; background: #333; color: white; border: 1px solid #555; padding: 8px; margin-right: 10px; border-radius: 4px; }
+        button { background: #e02; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; }
         iframe { width: 100%; height: calc(100% - 50px); border: none; background: white; }
     </style>
 </head>
 <body>
-    <div class="nav">
+    <div class="bar">
         <input type="text" id="url" placeholder="https://www.pkmn.gg">
-        <button onclick="launch()">GO</button>
+        <button onclick="go()">GO</button>
     </div>
-    <iframe id="viewer" sandbox="allow-forms allow-scripts allow-same-origin allow-popups"></iframe>
+    <iframe id="view"></iframe>
 
     <script>
-        function launch() {
-            let val = document.getElementById('url').value;
-            if (!val.startsWith('http')) val = 'https://' + val;
-            // Use the relative /proxy path
-            document.getElementById('viewer').src = `/proxy?url=${encodeURIComponent(val)}`;
+        function go() {
+            let addr = document.getElementById('url').value;
+            if (!addr.startsWith('http')) addr = 'https://' + addr;
+            // Launch the site via the /proxy route
+            document.getElementById('view').src = '/proxy?url=' + encodeURIComponent(addr);
         }
     </script>
 </body>
