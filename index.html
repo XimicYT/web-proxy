@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>No-Install Proxy</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #222; color: #fff; }
+        input { width: 70%; padding: 10px; border: none; }
+        button { padding: 10px 20px; background: #0f0; border: none; cursor: pointer; font-weight: bold; }
+        #output { background: #000; padding: 20px; margin-top: 20px; white-space: pre-wrap; border: 1px solid #444; }
+    </style>
+</head>
+<body>
+    <h1>☁️ Web Proxy</h1>
+    <input type="text" id="url" placeholder="Enter URL (e.g. https://jsonplaceholder.typicode.com/todos/1)">
+    <button onclick="fetchUrl()">GO</button>
+    <div id="output">Result will appear here...</div>
+
+    <script>
+        async function fetchUrl() {
+            const url = document.getElementById('url').value;
+            const output = document.getElementById('output');
+            
+            output.innerText = "Fetching...";
+            
+            // We ask OUR backend (/proxy) to fetch the target URL
+            try {
+                const res = await fetch(`/proxy?url=${encodeURIComponent(url)}`);
+                const text = await res.text();
+                output.innerText = text;
+            } catch (e) {
+                output.innerText = "Error: " + e;
+            }
+        }
+    </script>
+</body>
+</html>
