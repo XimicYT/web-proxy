@@ -1,153 +1,149 @@
 const express = require('express');
-const httpProxy = require('http-proxy');
+const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
 const cookieParser = require('cookie-parser');
-const zlib = require('zlib'); // Built-in Node module
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cookieParser());
 
-// The Magic Script to inject into every page
-// This overrides the browser's fetch and XHR tools to route everything through our proxy
+// --- THE NUCLEAR SCRIPT ---
+// 1. Nukes Service Workers (Fixes workbox errors)
+// 2. Intercepts fetch/XHR (Fixes socket.io errors)
 const INJECTED_SCRIPT = `
 <script>
 (function() {
-    console.log("--> Enterprise Proxy Interceptor Loaded <--");
+    console.warn("--- PROXY INTERCEPTOR ACTIVE ---");
 
-    // Helper: Rewrite external URLs to go through our proxy
+    // 1. BLOCK SERVICE WORKERS
+    // This forces the site to run in the main thread where we can control it
+    if (navigator.serviceWorker) {
+        navigator.serviceWorker.getRegistrations().then(regs => {
+            regs.forEach(r => r.unregister());
+        });
+        Object.defineProperty(navigator, 'serviceWorker', {
+            value: {
+                register: () => Promise.reject(new Error("ServiceWorkers disabled by Proxy")),
+                getRegistrations: () => Promise.resolve([]),
+                ready: Promise.reject(new Error("Disabled"))
+            },
+            writable: false
+        });
+    }
+
+    // 2. URL REWRITER
     function rewriteUrl(url) {
         if (!url) return url;
-        // If it's an absolute URL (http...) and NOT our own domain, proxy it!
+        
+        // If it's a relative path (starts with /), leave it alone (it goes to our proxy automatically)
+        if (typeof url === 'string' && url.startsWith('/')) return url;
+
+        // If it's a full URL (http...) and NOT our proxy, rewrite it
         if (typeof url === 'string' && url.startsWith('http') && !url.includes(window.location.host)) {
-            console.log("Rewriting request to:", url);
-            return '/proxy?url=' + encodeURIComponent(url);
+            console.log("Proxying:", url);
+            return window.location.origin + '/proxy?url=' + encodeURIComponent(url);
         }
         return url;
     }
 
-    // 1. Monkey Patch window.fetch
+    // 3. MONKEY PATCH FETCH
     const originalFetch = window.fetch;
     window.fetch = function(input, init) {
         if (typeof input === 'string') {
             input = rewriteUrl(input);
         } else if (input instanceof Request) {
-            // Clone the request with the new URL
             input = new Request(rewriteUrl(input.url), input);
         }
         return originalFetch(input, init);
     };
 
-    // 2. Monkey Patch XMLHttpRequest (This fixes the socket.io errors)
+    // 4. MONKEY PATCH XHR (Fixes Socket.io)
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url, ...args) {
-        url = rewriteUrl(url);
-        return originalOpen.call(this, method, url, ...args);
+        return originalOpen.call(this, method, rewriteUrl(url), ...args);
     };
+
 })();
 </script>
 `;
 
-const proxy = httpProxy.createProxyServer({
-    followRedirects: true,
+// Helper: Get target from query param OR cookie
+const getTarget = (req) => {
+    if (req.query.url) {
+        try { return new URL(req.query.url).origin; } catch (e) {}
+    }
+    return req.cookies.target_site || 'https://www.google.com';
+};
+
+// --- PROXY CONFIGURATION ---
+const proxyOptions = {
+    target: 'https://www.google.com', // Default fallback
     changeOrigin: true,
-    selfHandleResponse: true, // We will handle the output manually
-    secure: false
-});
+    selfHandleResponse: true,
+    cookieDomainRewrite: { "*": "" }, // Allow cookies on our domain
+    router: (req) => getTarget(req),  // Dynamic routing
+    onProxyReq: (proxyReq, req, res) => {
+        // Force the target to think we are a standard browser
+        proxyReq.setHeader('Accept-Encoding', 'identity'); // Disable gzip so we can edit HTML
+    },
+    onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
+        const targetOrigin = getTarget(req);
 
-proxy.on('error', (err, req, res) => {
-    console.error("Proxy Error:", err);
-    if (!res.headersSent) res.status(500).end();
-});
+        // 1. OVERWRITE CORS HEADERS
+        // We strip the target's strict rules and replace them with "Allow Everyone"
+        res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
 
-proxy.on('proxyReq', (proxyReq, req, res, options) => {
-    // CRITICAL: Tell the target server NOT to compress data (gzip).
-    // We need plain text so we can inject our script.
-    proxyReq.setHeader('Accept-Encoding', ''); 
-});
+        // Delete problematic security headers
+        delete proxyRes.headers['x-frame-options'];
+        delete proxyRes.headers['content-security-policy'];
+        delete proxyRes.headers['content-security-policy-report-only'];
+        delete proxyRes.headers['access-control-allow-origin']; // Remove original to avoid duplicates
 
-proxy.on('proxyRes', (proxyRes, req, res) => {
-    // 1. Clean up headers
-    delete proxyRes.headers['x-frame-options'];
-    delete proxyRes.headers['content-security-policy'];
-    delete proxyRes.headers['content-security-policy-report-only'];
-    delete proxyRes.headers['x-content-type-options'];
-    
-    // Remove content-length because we are adding our own script, changing the size
-    delete proxyRes.headers['content-length'];
-
-    // 2. Copy status and headers to our response
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-
-    // 3. Handle the body
-    let body = [];
-    proxyRes.on('data', function (chunk) {
-        body.push(chunk);
-    });
-
-    proxyRes.on('end', function () {
-        // Combine all chunks
-        let responseBody = Buffer.concat(body);
-        
-        // Check if this is an HTML page
+        // 2. INJECT SCRIPT INTO HTML
         const contentType = proxyRes.headers['content-type'] || '';
         if (contentType.includes('text/html')) {
-            try {
-                let htmlString = responseBody.toString('utf8');
-                // Inject our script right before the </head> tag
-                htmlString = htmlString.replace('</head>', INJECTED_SCRIPT + '</head>');
-                responseBody = Buffer.from(htmlString);
-            } catch (e) {
-                console.error("Error injecting script:", e);
-            }
+            let html = responseBuffer.toString('utf8');
+            // Inject immediately after <head> to run before other scripts
+            return html.replace('<head>', '<head>' + INJECTED_SCRIPT);
         }
+        return responseBuffer;
+    })
+};
 
-        // Send the modified body to the user
-        res.end(responseBody);
-    });
-});
+// --- ROUTES ---
 
-app.get('/', (req, res) => {
-    res.send('Proxy Backend Running. Double-click your index.html file now.');
-});
-
-app.use((req, res) => {
-    if (req.url === '/favicon.ico') return res.status(404).end();
-
-    let target = '';
-    let reqPath = req.url;
-
-    // Handle new request
-    if (req.url.startsWith('/proxy')) {
-        const queryUrl = req.query.url;
-        if (!queryUrl) return res.status(400).send("No URL provided");
-        
+// 1. Explicit Proxy Endpoint (/proxy?url=...)
+app.use('/proxy', (req, res, next) => {
+    if (req.query.url) {
         try {
-            const targetObj = new URL(queryUrl);
-            target = targetObj.origin;
-            reqPath = targetObj.pathname + targetObj.search;
-            // Set cookie for subsequent requests
-            res.cookie('target_site', target, { path: '/', sameSite: 'none', secure: true });
+            const urlObj = new URL(req.query.url);
+            // Set cookie so future relative requests work
+            res.cookie('target_site', urlObj.origin, { path: '/', sameSite: 'none', secure: true });
+            
+            // Fix the path for the proxy middleware
+            req.url = urlObj.pathname + urlObj.search;
         } catch (e) {
             return res.status(400).send("Invalid URL");
         }
-    } 
-    // Handle Assets / Sub-resources
-    else {
-        target = req.cookies.target_site;
-        if (!target) return res.status(404).send("No session found. Please go back to start.");
     }
+    next();
+}, createProxyMiddleware(proxyOptions));
 
-    req.url = reqPath; // Update URL to just the path (e.g., /style.css)
-
-    proxy.web(req, res, {
-        target: target,
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
-            'Referer': target,
-            'Origin': target
-        }
-    });
+// 2. Main Entry Point (Root)
+app.get('/', (req, res) => {
+    res.send('Proxy Running. Use your local index.html.');
 });
+
+// 3. Catch-All for Assets (scripts, images, API calls like /api/currency)
+// If the page requests /api/currency, it hits this route.
+app.use((req, res, next) => {
+    if (!req.cookies.target_site) {
+        return res.status(404).send("Session lost. Go back to start.");
+    }
+    next();
+}, createProxyMiddleware(proxyOptions));
 
 app.listen(PORT, () => console.log(`Proxy running on ${PORT}`));
