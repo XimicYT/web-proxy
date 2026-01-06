@@ -57,7 +57,8 @@
             // Point the iframe to your Render proxy URL
             // Replace 'your-app.onrender.com' with your actual Render URL
             const proxyUrl = `https://web-prox.onrender.com/proxy?url=${encodeURIComponent(targetUrl)}`;
-
+            // In your index.html script, before setting frame.src
+            frame.setAttribute("sandbox", "allow-forms allow-scripts allow-same-origin");
             frame.src = proxyUrl;
         }
     </script>
