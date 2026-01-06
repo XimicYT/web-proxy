@@ -7,103 +7,105 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cookieParser());
-app.use(express.static(path.join(__dirname, 'public'))); // Optional: for local assets
 
-// Create Proxy Server
+// Create the Proxy
 const proxy = httpProxy.createProxyServer({
     followRedirects: true,
     changeOrigin: true,
-    selfHandleResponse: false
+    selfHandleResponse: false,
+    secure: false // Ignores SSL certificate errors from target
 });
 
-// ERROR HANDLING
+// --- ERROR HANDLING ---
 proxy.on('error', (err, req, res) => {
     console.error("Proxy Error:", err);
-    res.status(500).send("Proxy Error: " + err.message);
+    res.status(500).end();
 });
 
-// RESPONSE INTERCEPTOR (The Magic)
-// This fixes "Location" headers so redirects stay within the proxy
-proxy.on('proxyRes', function (proxyRes, req, res) {
-    // 1. Rewrite Location Header (for redirects)
+// --- THE MAGIC: HEADER MANIPULATION ---
+proxy.on('proxyRes', (proxyRes, req, res) => {
+    // 1. Delete headers that block iframes
+    delete proxyRes.headers['x-frame-options'];
+    delete proxyRes.headers['content-security-policy'];
+    delete proxyRes.headers['content-security-policy-report-only'];
+    delete proxyRes.headers['x-content-type-options'];
+
+    // 2. Fix Redirects (301/302)
+    // If the site tries to redirect to https://google.com, we capture it
+    // and force it back through our proxy URL.
     if (proxyRes.headers['location']) {
         let location = proxyRes.headers['location'];
-        // If the redirect is absolute (https://target.com/...), force it back to our proxy
         if (location.startsWith('http')) {
             const newUrl = new URL(location);
-            // Update the session cookie to the new domain
-            res.cookie('current_site', newUrl.origin, { path: '/' });
-            // Redirect browser to /proxy?url=... so it re-enters our logic
+            res.cookie('target_site', newUrl.origin, { path: '/' });
             proxyRes.headers['location'] = `/proxy?url=${encodeURIComponent(location)}`;
         }
     }
 
-    // 2. Rewrite Cookie Domains (so the browser accepts them)
-    // If pkmn.gg sets a cookie for ".pkmn.gg", your localhost browser will drop it. 
-    // We strip the domain so it defaults to localhost.
-    const rawCookies = proxyRes.headers['set-cookie'];
-    if (rawCookies) {
-        proxyRes.headers['set-cookie'] = rawCookies.map(cookie => {
-            return cookie.replace(/Domain=[^;]+;/gi, ''); 
-        });
+    // 3. Fix Cookies
+    // If the site sets a cookie for ".pkmn.gg", we strip the domain
+    // so your localhost browser accepts it.
+    if (proxyRes.headers['set-cookie']) {
+        proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(c => 
+            c.replace(/Domain=[^;]+;/gi, '')
+        );
     }
 });
 
-// 1. UI Route
+// --- ROUTE 1: THE UI ---
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 2. Proxy Logic
+// --- ROUTE 2: THE PROXY HANDLER ---
 app.use((req, res) => {
-    // Ignore direct requests to favicon (optional)
+    // Ignore favicon requests to keep logs clean
     if (req.url === '/favicon.ico') return res.status(404).end();
 
     let target = '';
-    
-    // CASE A: User explicitly enters a URL via query param (e.g., /proxy?url=...)
+    let reqPath = req.url;
+
+    // A. Is this a new request from the search bar?
     if (req.url.startsWith('/proxy')) {
         const queryUrl = req.query.url;
-        if (queryUrl) {
-            target = queryUrl;
+        if (!queryUrl) return res.status(400).send("No URL provided");
+        
+        try {
+            const targetObj = new URL(queryUrl);
+            target = targetObj.origin; // https://pkmn.gg
+            reqPath = targetObj.pathname + targetObj.search; // /cards/charizard
             
-            // Parse the target to get the origin (https://site.com) and the path (/home)
-            try {
-                const targetObj = new URL(target);
-                
-                // Save origin to cookie for future asset requests
-                res.cookie('current_site', targetObj.origin, { path: '/' });
-
-                // CRITICAL FIX: Rewrite req.url to the actual path the target expects
-                // If user asks for /proxy?url=https://site.com/foo, target needs /foo
-                req.url = targetObj.pathname + targetObj.search;
-                
-                // Set the target for the proxy
-                target = targetObj.origin;
-            } catch (e) {
-                return res.status(400).send("Invalid URL provided");
-            }
+            // Save this new target in a cookie so assets (css/js) know where to go
+            res.cookie('target_site', target, { path: '/' });
+        } catch (e) {
+            return res.status(400).send("Invalid URL");
         }
     } 
-    // CASE B: Browser requests assets (style.css, /_next/static/...)
-    // We look at the cookie to remember where we are connected.
+    // B. Or is this a background asset (CSS, JS, Images)?
     else {
-        const storedSite = req.cookies.current_site;
-        if (storedSite) {
-            target = storedSite;
-        } else {
-            // No cookie and no URL param? Send them back to home.
+        target = req.cookies.target_site;
+        if (!target) {
+            // If we don't know where to go, go back to home
             return res.redirect('/');
         }
     }
 
-    // Perform the Proxy
-    console.log(`Proxying ${req.method} ${req.url} -> ${target}`);
-    
+    console.log(`[${req.method}] Proxying to: ${target}${reqPath}`);
+
+    // Set the URL manually to ensure the target receives the correct path
+    req.url = reqPath;
+
     proxy.web(req, res, {
         target: target,
-        changeOrigin: true
+        headers: {
+            // Spoof User Agent to look like a real PC, not a bot
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
+            'Referer': target
+        }
     });
 });
 
-app.listen(PORT, () => console.log(`Enterprise Proxy running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`\n>>> ENTERPRISE PROXY RUNNING ON PORT ${PORT}`);
+    console.log(`>>> Open http://localhost:${PORT}\n`);
+});
