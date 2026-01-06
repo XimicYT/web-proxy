@@ -4,30 +4,26 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CONFIGURATION
 const TARGET_MAIN = 'https://www.pkmn.gg';
 const TARGET_SOCKET = 'https://sockets.pkmn.gg';
 
-// --- 1. THE BRAIN IMPLANT (Client-Side) ---
-// This script is injected into every HTML page to hijack fetch, XHR, and WebSockets
+// --- 1. THE BRAIN IMPLANT (React-Safe Version) ---
+// We inject this at the very END of the body so we don't break React Hydration in the <head>
 const CLIENT_INJECTION = `
 <script>
 (function() {
-    console.log("--- PROXY IMPLANT V4 ACTIVE ---");
-    const TARGET_MAIN = '${TARGET_MAIN}';
-    const TARGET_SOCKET = '${TARGET_SOCKET}';
-
-    // Helper to rewrite URLs from absolute to relative
+    console.log("--- PROXY IMPLANT V5 ACTIVE ---");
+    
+    // Helper: Rewrite URLs to remove the target domain
     const rewriteUrl = (url) => {
         if (!url || typeof url !== 'string') return url;
-        // Rewrite main domain
-        let newUrl = url.replace(TARGET_MAIN, '');
-        // Rewrite socket domain (crucial for games)
-        newUrl = newUrl.replace(TARGET_SOCKET, '');
+        let newUrl = url.replace('${TARGET_MAIN}', '').replace('${TARGET_SOCKET}', '');
+        // Fix double slashes if they occur (excluding http://)
+        if (newUrl.startsWith('//')) newUrl = newUrl.substring(1);
         return newUrl;
     };
 
-    // A. Disable Service Workers (They bypass proxies)
+    // A. Nuke Service Workers (They prevent proxying)
     if ('serviceWorker' in navigator) {
         navigator.serviceWorker.getRegistrations().then(regs => {
             regs.forEach(r => r.unregister());
@@ -35,7 +31,7 @@ const CLIENT_INJECTION = `
         navigator.serviceWorker.register = () => Promise.resolve();
     }
 
-    // B. Intercept FETCH
+    // B. Intercept Fetch
     const originalFetch = window.fetch;
     window.fetch = function(input, init) {
         if (typeof input === 'string') {
@@ -51,99 +47,64 @@ const CLIENT_INJECTION = `
     XMLHttpRequest.prototype.open = function(method, url) {
         return originalOpen.apply(this, [method, rewriteUrl(url)]);
     };
-
-    // D. Intercept WebSocket (The "Game" Layer)
-    const OriginalWebSocket = window.WebSocket;
-    window.WebSocket = function(url, protocols) {
-        // Rewrite wss://sockets.pkmn.gg to wss://your-proxy.com/socket.io...
-        // But since we are proxying, we usually just want relative paths or current host
-        let newUrl = url;
-        if (url.includes('sockets.pkmn.gg')) {
-            // We force it to talk to OUR server, which forwards to theirs
-            newUrl = url.replace('wss://sockets.pkmn.gg', window.location.origin.replace('http', 'ws'));
-            // If the original path didn't have /socket.io, we might need to adjust, 
-            // but usually direct replacement works if proxy is set up right.
-        }
-        return new OriginalWebSocket(newUrl, protocols);
-    };
 })();
 </script>
 `;
 
-// --- 2. COMMON PROXY OPTIONS ---
+// --- 2. CONFIGURATION ---
+
 const commonOptions = {
+    target: TARGET_MAIN,
     changeOrigin: true,
-    secure: true, // Validate SSL to target
-    cookieDomainRewrite: {
-        "*": "" // Rewrite ALL cookies to match the current domain (Render)
-    },
+    secure: true,
+    cookieDomainRewrite: { "*": "" }, // Allow cookies on our proxy domain
     onProxyReq: (proxyReq, req, res) => {
-        // 1. Force plain text so we can inject script
-        proxyReq.setHeader('Accept-Encoding', 'identity');
-        
-        // 2. Spoof User Agent
+        proxyReq.setHeader('Accept-Encoding', 'identity'); // Force plain text
         proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36');
         
-        // 3. Remove headers that reveal we are a proxy
+        // Remove headers that might trigger bot detection
         proxyReq.removeHeader('Origin');
         proxyReq.removeHeader('Referer');
-        proxyReq.removeHeader('Cookie'); // We manually manage cookies if needed, but standard pass-through is usually best. 
-        // ACTUALLY: Let browser send cookies, but we rely on cookieDomainRewrite to ensure browser HAS them.
-        
-        // If the client sent us a cookie, forward it.
     },
-    selfHandleResponse: true, // We want to edit the response
+    selfHandleResponse: true,
     onProxyRes: (proxyRes, req, res) => {
         let originalBody = [];
-        
-        // Capture data
         proxyRes.on('data', (chunk) => originalBody.push(chunk));
-        
         proxyRes.on('end', () => {
             const bodyBuffer = Buffer.concat(originalBody);
             let finalBody = bodyBuffer;
             const contentType = proxyRes.headers['content-type'] || '';
-            const statusCode = proxyRes.statusCode;
 
-            // 1. Handle Redirects (301, 302, 307, 308)
-            // If the target says "Go to pkmn.gg/login", we say "Go to /login"
-            if (statusCode >= 300 && statusCode < 400 && proxyRes.headers['location']) {
-                let redirectLoc = proxyRes.headers['location'];
-                redirectLoc = redirectLoc.replace(TARGET_MAIN, '');
-                redirectLoc = redirectLoc.replace(TARGET_SOCKET, '');
-                res.setHeader('Location', redirectLoc);
+            // 1. Handle Redirects (Fix the "Escape" issue)
+            if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers['location']) {
+                let redirect = proxyRes.headers['location'];
+                redirect = redirect.replace(TARGET_MAIN, '').replace(TARGET_SOCKET, '');
+                res.setHeader('Location', redirect);
             }
 
-            // 2. Strip Security Headers (Allow iframe, allow scripts)
-            const headersToDelete = [
-                'content-security-policy',
-                'content-security-policy-report-only',
-                'strict-transport-security',
-                'x-frame-options',
-                'x-content-type-options'
-            ];
-            
-            // Copy headers from target to client
-            Object.keys(proxyRes.headers).forEach((key) => {
-                if (key === 'content-length') return; // We calculate new length
-                if (key === 'content-encoding') return; // We decoded it
-                if (headersToDelete.includes(key.toLowerCase())) return;
-                res.setHeader(key, proxyRes.headers[key]);
+            // 2. Strip Security Headers
+            const headersToDelete = ['content-security-policy', 'x-frame-options', 'strict-transport-security'];
+            Object.keys(proxyRes.headers).forEach(key => {
+                if (!headersToDelete.includes(key.toLowerCase()) && key !== 'content-length' && key !== 'content-encoding') {
+                    res.setHeader(key, proxyRes.headers[key]);
+                }
             });
 
-            // 3. Inject Script (Only into HTML)
+            // 3. Inject Script (SAFE MODE: End of Body)
             if (contentType.includes('text/html')) {
                 try {
-                    let bodyString = bodyBuffer.toString('utf8');
-                    // Inject immediately after <head> for earliest execution
-                    bodyString = bodyString.replace('<head>', '<head>' + CLIENT_INJECTION);
-                    finalBody = Buffer.from(bodyString);
-                } catch (e) {
-                    console.error("Injection failed", e);
-                }
+                    let bodyStr = bodyBuffer.toString('utf8');
+                    // We append BEFORE the closing body tag to avoid breaking React's Head
+                    if (bodyStr.includes('</body>')) {
+                        bodyStr = bodyStr.replace('</body>', CLIENT_INJECTION + '</body>');
+                    } else {
+                        bodyStr += CLIENT_INJECTION;
+                    }
+                    finalBody = Buffer.from(bodyStr);
+                } catch (e) { console.error(e); }
             }
 
-            res.status(statusCode);
+            res.status(proxyRes.statusCode);
             res.end(finalBody);
         });
     }
@@ -151,31 +112,24 @@ const commonOptions = {
 
 // --- 3. ROUTES ---
 
-// Helper route to check if proxy is alive
-app.get('/health-check', (req, res) => res.send('Proxy is active'));
+// Fix for the user's "Old URL" habit
+// If they visit /proxy?url=..., redirect them to root
+app.use((req, res, next) => {
+    if (req.url.startsWith('/proxy')) {
+        return res.redirect('/');
+    }
+    next();
+});
 
-// SOCKET.IO TRAFFIC
-// We map /socket.io requests to the socket target
+// Socket.io Proxy
 app.use('/socket.io', createProxyMiddleware({
     target: TARGET_SOCKET,
     changeOrigin: true,
-    ws: true, // Enable WebSocket proxying
-    logLevel: 'debug',
-    cookieDomainRewrite: { "*": "" },
-    onProxyReq: (proxyReq) => {
-        // Sockets are picky. We MUST pretend to be the main site.
-        proxyReq.setHeader('Origin', TARGET_MAIN);
-    }
+    ws: true,
+    onProxyReq: (proxyReq) => proxyReq.setHeader('Origin', TARGET_MAIN)
 }));
 
-// MAIN TRAFFIC
-// Everything else goes to the main site
-app.use('/', createProxyMiddleware({
-    target: TARGET_MAIN,
-    ...commonOptions
-}));
+// Main Site Proxy
+app.use('/', createProxyMiddleware(commonOptions));
 
-app.listen(PORT, () => {
-    console.log(`--- ENTERPRISE PROXY RUNNING ON PORT ${PORT} ---`);
-    console.log(`Target: ${TARGET_MAIN}`);
-});
+app.listen(PORT, () => console.log(`--- PROXY V5 RUNNING ON ${PORT} ---`));
