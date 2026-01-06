@@ -24,7 +24,7 @@
             
             // We ask OUR backend (/proxy) to fetch the target URL
             try {
-                const res = await fetch(`/proxy?url=${encodeURIComponent(url)}`);
+                const res = await fetch(`https://web-prox.onrender.com/proxy?url=${encodeURIComponent(url)}`);
                 const text = await res.text();
                 output.innerText = text;
             } catch (e) {
