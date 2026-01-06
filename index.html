@@ -1,67 +1,29 @@
 <!DOCTYPE html>
 <html>
-
 <head>
-    <title>No-Install Proxy</title>
+    <title>Heavy Web Proxy</title>
     <style>
-        body {
-            font-family: monospace;
-            padding: 20px;
-            background: #222;
-            color: #fff;
-        }
-
-        input {
-            width: 70%;
-            padding: 10px;
-            border: none;
-        }
-
-        button {
-            padding: 10px 20px;
-            background: #0f0;
-            border: none;
-            cursor: pointer;
-            font-weight: bold;
-        }
-
-        #output {
-            background: #000;
-            padding: 20px;
-            margin-top: 20px;
-            white-space: pre-wrap;
-            border: 1px solid #444;
-        }
+        body, html { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1a1a1a; font-family: sans-serif; }
+        .nav { height: 50px; background: #333; display: flex; align-items: center; padding: 0 20px; gap: 10px; }
+        input { flex: 1; padding: 8px; border-radius: 4px; border: none; }
+        button { padding: 8px 15px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        iframe { width: 100%; height: calc(100% - 50px); border: none; background: white; }
     </style>
 </head>
-
 <body>
-    <h1>☁️ Web Proxy</h1>
-    <input type="text" id="url" placeholder="Enter URL (e.g. https://jsonplaceholder.typicode.com/todos/1)">
-    <button onclick="fetchUrl()">GO</button>
-    <div id="output">Result will appear here...</div>
-    <iframe id="browserFrame"
-        style="width:100%; height:80vh; border:1px solid #444; margin-top:20px; background:white;"></iframe>
+    <div class="nav">
+        <input type="text" id="url" placeholder="https://www.pkmn.gg">
+        <button onclick="launch()">GO</button>
+    </div>
+    <iframe id="viewer" sandbox="allow-forms allow-scripts allow-same-origin allow-popups"></iframe>
 
     <script>
-        function fetchUrl() {
-            const urlInput = document.getElementById('url').value;
-            const frame = document.getElementById('browserFrame');
-
-            // Add http if the user forgot it
-            let targetUrl = urlInput;
-            if (!targetUrl.startsWith('http')) {
-                targetUrl = 'https://' + targetUrl;
-            }
-
-            // Point the iframe to your Render proxy URL
-            // Replace 'your-app.onrender.com' with your actual Render URL
-            const proxyUrl = `https://web-prox.onrender.com/proxy?url=${encodeURIComponent(targetUrl)}`;
-            // In your index.html script, before setting frame.src
-            frame.setAttribute("sandbox", "allow-forms allow-scripts allow-same-origin");
-            frame.src = proxyUrl;
+        function launch() {
+            let val = document.getElementById('url').value;
+            if (!val.startsWith('http')) val = 'https://' + val;
+            // Use the relative /proxy path
+            document.getElementById('viewer').src = `/proxy?url=${encodeURIComponent(val)}`;
         }
     </script>
 </body>
-
 </html>
