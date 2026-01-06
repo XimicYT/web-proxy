@@ -7,17 +7,11 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cookieParser());
 
-// --- THE POLITE SPY SCRIPT ---
-// instead of breaking the Service Worker, we pretend it works perfectly.
-// This prevents the "addEventListener is not a function" crash.
+// --- THE POLITE SPY SCRIPT (Prevents crash) ---
 const INJECTED_SCRIPT = `
 <script>
 (function() {
     console.warn("--- PROXY INTERCEPTOR ACTIVE (SPY MODE) ---");
-
-    // 1. FAKE SERVICE WORKER (The "Spy")
-    // We create a dummy object that looks exactly like a real Service Worker
-    // so the website code runs happily, but nothing actually happens.
     const dummyRegistration = {
         active: { scriptURL: '', state: 'activated' },
         installing: null,
@@ -27,38 +21,23 @@ const INJECTED_SCRIPT = `
         update: () => Promise.resolve(true),
         onupdatefound: null
     };
-
     Object.defineProperty(navigator, 'serviceWorker', {
         value: {
-            // When site asks to register, say "Sure!" but do nothing
-            register: () => { 
-                console.log('Proxy: Service Worker registration intercepted (Fake Success)');
-                return Promise.resolve(dummyRegistration); 
-            },
-            // When site asks for existing workers, give them nothing or the dummy
+            register: () => { console.log('Proxy: SW intercepted'); return Promise.resolve(dummyRegistration); },
             getRegistrations: () => Promise.resolve([]),
-            // When site adds listeners, just nod and smile
-            addEventListener: (type, listener) => { 
-                console.log('Proxy: SW Listener ignored for ' + type); 
-            },
+            addEventListener: () => {},
             removeEventListener: () => {},
-            // Important: Tell the site there is NO controller handling the page currently
             controller: null, 
             ready: Promise.resolve(dummyRegistration),
             startMessages: () => {}
         },
-        writable: false,
-        configurable: false
+        writable: false
     });
 
-    // 2. URL REWRITER & FETCH INTERCEPTOR
     function rewriteUrl(url) {
         if (!url) return url;
-        // If relative, leave it alone
         if (typeof url === 'string' && url.startsWith('/')) return url;
-        // If external, route through proxy
         if (typeof url === 'string' && url.startsWith('http') && !url.includes(window.location.host)) {
-            console.log("Proxying request:", url);
             return window.location.origin + '/proxy?url=' + encodeURIComponent(url);
         }
         return url;
@@ -75,7 +54,6 @@ const INJECTED_SCRIPT = `
     XMLHttpRequest.prototype.open = function(method, url, ...args) {
         return originalOpen.call(this, method, rewriteUrl(url), ...args);
     };
-
 })();
 </script>
 `;
@@ -93,18 +71,28 @@ const proxyOptions = {
     selfHandleResponse: true,
     cookieDomainRewrite: { "*": "" },
     router: (req) => getTarget(req),
+    
+    // --- STEALTH MODE ---
     onProxyReq: (proxyReq, req, res) => {
-        proxyReq.setHeader('Accept-Encoding', 'identity'); // Disable gzip
+        // 1. Strip headers that reveal we are a proxy
+        proxyReq.removeHeader('Referer');
+        proxyReq.removeHeader('Origin');
+        
+        // 2. Spoof a real browser User-Agent to avoid bot blocking
+        proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        
+        // 3. Disable compression so we can edit HTML
+        proxyReq.setHeader('Accept-Encoding', 'identity'); 
     },
-    onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
-        const targetOrigin = getTarget(req);
 
-        // Allow CORS for everyone
+    onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
+        // Set loose CORS to allow everything
         res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
 
+        // Remove security headers that break things
         delete proxyRes.headers['x-frame-options'];
         delete proxyRes.headers['content-security-policy'];
         delete proxyRes.headers['content-security-policy-report-only'];
@@ -112,31 +100,46 @@ const proxyOptions = {
         const contentType = proxyRes.headers['content-type'] || '';
         if (contentType.includes('text/html')) {
             let html = responseBuffer.toString('utf8');
-            // Inject Spy Script
             return html.replace('<head>', '<head>' + INJECTED_SCRIPT);
         }
         return responseBuffer;
-    })
+    }),
+    onError: (err, req, res) => {
+        console.error("Proxy Error:", err);
+        res.status(500).send("Proxy connectivity error.");
+    }
 };
 
-// Routes
+// Route 1: Explicit Proxy
 app.use('/proxy', (req, res, next) => {
     if (req.query.url) {
         try {
             const urlObj = new URL(req.query.url);
+            // Force cookie set immediately
             res.cookie('target_site', urlObj.origin, { path: '/', sameSite: 'none', secure: true });
+            
+            // Rewrite URL for the proxy middleware
             req.url = urlObj.pathname + urlObj.search;
         } catch (e) { return res.status(400).send("Invalid URL"); }
     }
     next();
 }, createProxyMiddleware(proxyOptions));
 
+// Route 2: Debug Health Check
+app.get('/health', (req, res) => res.send('Proxy is alive'));
+
+// Route 3: Root
 app.get('/', (req, res) => {
-    res.send('Proxy Active. Run your index.html locally.');
+    res.send('Proxy Backend Active. Open your local index.html.');
 });
 
+// Route 4: Catch-All (Assets/API)
 app.use((req, res, next) => {
-    if (!req.cookies.target_site) return res.status(404).send("Session lost.");
+    if (!req.cookies.target_site) {
+        // If we lost the cookie, try to recover using Referer or default
+        console.log("Missing cookie for:", req.url);
+        return res.status(404).send("Session lost. Please reload from the start.");
+    }
     next();
 }, createProxyMiddleware(proxyOptions));
 
