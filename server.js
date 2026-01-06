@@ -20,14 +20,25 @@ app.get('/proxy', async (req, res) => {
     if (!url) return res.status(400).send('Missing url');
 
     try {
+        const targetUrl = new URL(url);
         const response = await fetch(url);
-        const body = await response.text();
+        let body = await response.text();
+
+        // REWRITE LOGIC:
+        // This finds attributes like src="/..." or href="/..." 
+        // and changes them to src="https://target.com/..."
+        const baseUrl = `${targetUrl.protocol}//${targetUrl.host}`;
         
-        // This line tells the browser "This is a webpage"
+        // Fix absolute paths (starting with /)
+        body = body.replace(/(src|href|action)="\/(?!\/)/g, `$1="${baseUrl}/`);
+        
+        // Fix relative paths (starting with ./)
+        body = body.replace(/(src|href|action)="\.\//g, `$1="${baseUrl}/`);
+
         res.setHeader('Content-Type', 'text/html');
         res.send(body);
     } catch (err) {
-        res.status(500).send("Error fetching site: " + err.message);
+        res.status(500).send("Error: " + err.message);
     }
 });
 
