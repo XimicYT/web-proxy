@@ -1,68 +1,98 @@
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
-const zlib = require('zlib'); // Included in Node.js standard library
+const zlib = require('zlib');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // CONFIGURATION
-const PROXY_URL = 'https://web-prox.onrender.com'; // Make sure this matches your Render URL
+// NOTE: We don't need to hardcode your Render URL here anymore.
+// The script below calculates it automatically.
 const TARGET_MAIN = 'https://www.pkmn.gg';
 const TARGET_SOCKET = 'https://sockets.pkmn.gg';
 
-// --- HELPER: URL REWRITER ---
-const rewriteBody = (body) => {
-    if (typeof body !== 'string') return body;
-    return body
-        .replace(new RegExp(TARGET_MAIN, 'g'), PROXY_URL)
-        .replace(new RegExp(TARGET_SOCKET, 'g'), PROXY_URL)
-        .replace(/integrity="[^"]*"/g, ''); // Remove security checks
-};
+// --- THE BRAIN IMPLANT SCRIPT ---
+// This script runs inside the user's browser, NOT on the server.
+const CLIENT_INJECTION = `
+<script>
+(function() {
+    console.log("--- PROXY INTERCEPTOR ACTIVE ---");
+
+    // 1. KILL SERVICE WORKERS (Critical)
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(function(registrations) {
+            for(let registration of registrations) {
+                console.log("Killing Service Worker:", registration);
+                registration.unregister();
+            }
+        });
+        // Disable future registration
+        navigator.serviceWorker.register = () => Promise.resolve();
+    }
+
+    // 2. INTERCEPT FETCH REQUESTS
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options) {
+        if (typeof url === 'string') {
+            // Redirect API calls to relative paths (which go to the proxy)
+            if (url.includes('pkmn.gg')) {
+                url = url.replace('https://www.pkmn.gg', '');
+                url = url.replace('https://sockets.pkmn.gg', '');
+            }
+        }
+        return originalFetch(url, options);
+    };
+
+    // 3. INTERCEPT XMLHTTPREQUEST (AJAX)
+    const originalOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        if (typeof url === 'string') {
+            if (url.includes('pkmn.gg')) {
+                url = url.replace('https://www.pkmn.gg', '');
+                url = url.replace('https://sockets.pkmn.gg', '');
+            }
+        }
+        return originalOpen.apply(this, arguments);
+    };
+})();
+</script>
+`;
 
 // --- MANUAL RESPONSE HANDLER ---
-// This function manually processes the response to prevent Header crashes
 const handleProxyRes = (proxyRes, req, res) => {
     let originalBody = [];
-
-    // 1. Collect the data chunks as they arrive
-    proxyRes.on('data', (chunk) => {
-        originalBody.push(chunk);
-    });
-
-    // 2. Once all data is received, process it
+    proxyRes.on('data', (chunk) => originalBody.push(chunk));
     proxyRes.on('end', () => {
         const bodyBuffer = Buffer.concat(originalBody);
         let finalBody = bodyBuffer;
         const contentType = proxyRes.headers['content-type'] || '';
 
-        // 3. Copy headers from the target to the client
+        // Copy headers (excluding ones we manage)
         Object.keys(proxyRes.headers).forEach((key) => {
-            // Skip these headers because we are modifying the content
-            if (key === 'content-length' || key === 'content-encoding') return; 
+            if (key === 'content-length' || key === 'content-encoding') return;
             res.setHeader(key, proxyRes.headers[key]);
         });
 
-        // 4. Force CORS and remove blocks
+        // Set Access Headers
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', '*');
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.removeHeader('x-frame-options');
         res.removeHeader('content-security-policy');
-        res.removeHeader('content-security-policy-report-only');
 
-        // 5. If it's text/html/json, rewrite the URLs
-        if (contentType.includes('text') || contentType.includes('application/javascript') || contentType.includes('application/json')) {
+        // INJECT THE SCRIPT into HTML pages
+        if (contentType.includes('text/html')) {
             try {
                 let bodyString = bodyBuffer.toString('utf8');
-                bodyString = rewriteBody(bodyString);
+                // Insert our script right after <head>
+                bodyString = bodyString.replace('<head>', '<head>' + CLIENT_INJECTION);
+                // Also do a basic replace for the initial load
+                bodyString = bodyString.replace(new RegExp(TARGET_MAIN, 'g'), ''); 
                 finalBody = Buffer.from(bodyString);
             } catch (e) {
-                console.error("Rewrite failed, sending original:", e);
+                console.error("Injection failed:", e);
             }
         }
 
-        // 6. Send the final response
         res.status(proxyRes.statusCode);
         res.end(finalBody);
     });
@@ -70,10 +100,9 @@ const handleProxyRes = (proxyRes, req, res) => {
 
 const commonOptions = {
     changeOrigin: true,
-    selfHandleResponse: true, // We are handling the response manually above
+    selfHandleResponse: true,
     onProxyReq: (proxyReq, req, res) => {
-        // Ask for plain text (no gzip) so we can edit strings easily
-        proxyReq.setHeader('Accept-Encoding', 'identity');
+        proxyReq.setHeader('Accept-Encoding', 'identity'); // No gzip
         proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         proxyReq.removeHeader('Origin');
         proxyReq.removeHeader('Referer');
@@ -83,17 +112,20 @@ const commonOptions = {
 
 // --- ROUTES ---
 
-// 1. Socket.io Traffic
+// Socket.io specific handling
 app.use('/socket.io', createProxyMiddleware({
-    ...commonOptions,
     target: TARGET_SOCKET,
-    ws: true 
+    changeOrigin: true,
+    ws: true, // Enable Websockets
+    onProxyReq: (proxyReq) => {
+        proxyReq.setHeader('Origin', TARGET_MAIN); // Fool the socket server
+    }
 }));
 
-// 2. Main Traffic
+// Everything else
 app.use('/', createProxyMiddleware({
     ...commonOptions,
     target: TARGET_MAIN,
 }));
 
-app.listen(PORT, () => console.log(`Manual Rewriter Proxy running on ${PORT}`));
+app.listen(PORT, () => console.log(`Injection Proxy running on ${PORT}`));
