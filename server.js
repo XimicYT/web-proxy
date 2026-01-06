@@ -17,17 +17,17 @@ app.get('/', (req, res) => {
 // 3. The Proxy Logic
 app.get('/proxy', async (req, res) => {
     const { url } = req.query;
-
-    if (!url) return res.status(400).send('Missing url parameter');
+    if (!url) return res.status(400).send('Missing url');
 
     try {
         const response = await fetch(url);
         const body = await response.text();
         
-        // Pass the original status code back
-        res.status(response.status).send(body);
+        // This line tells the browser "This is a webpage"
+        res.setHeader('Content-Type', 'text/html');
+        res.send(body);
     } catch (err) {
-        res.status(500).send(err.message);
+        res.status(500).send("Error fetching site: " + err.message);
     }
 });
 
