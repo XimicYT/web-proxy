@@ -1,79 +1,77 @@
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
-const zlib = require('zlib'); // Added to handle compression if needed
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- TARGETS ---
+// --- CONFIGURATION ---
 const TARGET_MAIN = 'https://www.pkmn.gg';
 const TARGET_SOCKET = 'https://sockets.pkmn.gg';
 const TARGET_NAKED = 'https://pkmn.gg';
 
-// --- 1. CLIENT IMPLANT (The "History Hijack") ---
+// --- 1. THE "BRAIN IMPLANT" (Client-Side Protection) ---
+// This runs in your browser to catch any redirects that slip through.
 const CLIENT_INJECTION = `
 <script>
     (function() {
-        console.log("--- PROXY V10: ARCHITECT ACTIVE ---");
+        console.log("--- PROXY V11 ACTIVE ---");
         const PROXY_ORIGIN = window.location.origin;
 
-        // 1. Helper to clean URLs
-        function cleanUrl(url) {
+        // Helper: Clean URLs
+        function clean(url) {
             if (typeof url === 'string' && url.includes('pkmn.gg')) {
-                // Remove the domain, keep the path
                 return url.replace(/https?:\\/\\/(www\\.)?pkmn\\.gg/g, PROXY_ORIGIN);
             }
             return url;
         }
 
-        // 2. Hijack History (Next.js uses this for navigation)
-        const originalPush = history.pushState;
-        const originalReplace = history.replaceState;
-
-        history.pushState = function(state, unused, url) {
-            return originalPush.apply(this, [state, unused, cleanUrl(url)]);
-        };
-        history.replaceState = function(state, unused, url) {
-            return originalReplace.apply(this, [state, unused, cleanUrl(url)]);
-        };
-
-        // 3. Hijack Window.Open
-        const originalOpen = window.open;
-        window.open = function(url, target, features) {
-            return originalOpen.apply(this, [cleanUrl(url), target, features]);
-        };
-
-        // 4. Hijack Fetch (API Calls)
+        // 1. Trap Fetch Requests (API calls)
         const originalFetch = window.fetch;
-        window.fetch = function(input, init) {
-            if (typeof input === 'string') input = cleanUrl(input);
-            // Also clean the body if it sends the URL to the server
+        window.fetch = async function(input, init) {
+            if (typeof input === 'string') input = clean(input);
             if (init && init.body && typeof init.body === 'string') {
+                // Fix the body if it sends the wrong URL to the server
                 init.body = init.body.replace(/https?:\\/\\/(www\\.)?pkmn\\.gg/g, PROXY_ORIGIN);
             }
             return originalFetch(input, init);
         };
 
-        // 5. Hijack XHR (Old Ajax)
-        const originalXhrOpen = XMLHttpRequest.prototype.open;
+        // 2. Trap XHR (Old Ajax calls)
+        const originalOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url) {
-            return originalXhrOpen.apply(this, [method, cleanUrl(url)]);
+            return originalOpen.apply(this, [method, clean(url)]);
+        };
+
+        // 3. Trap History (Prevent URL bar changes)
+        const originalPush = history.pushState;
+        history.pushState = function(state, title, url) {
+            return originalPush.apply(this, [state, title, clean(url)]);
+        };
+        const originalReplace = history.replaceState;
+        history.replaceState = function(state, title, url) {
+            return originalReplace.apply(this, [state, title, clean(url)]);
+        };
+        
+        // 4. Trap Window Open
+        const originalWindowOpen = window.open;
+        window.open = function(url, target, features) {
+            return originalWindowOpen.apply(this, [clean(url), target, features]);
         };
     })();
 </script>
 `;
 
-// --- 2. CONFIGURATION ---
+// --- 2. PROXY LOGIC ---
 
 const commonOptions = {
     target: TARGET_MAIN,
     changeOrigin: true,
     secure: true,
     cookieDomainRewrite: { "*": "" },
-    selfHandleResponse: true, 
-    
+    selfHandleResponse: true, // We control the output
+
     onProxyReq: (proxyReq, req, res) => {
-        // Force identity so we don't have to unzip files (faster)
+        // Force plain text so we can rewrite it
         proxyReq.setHeader('Accept-Encoding', 'identity');
         proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36');
         proxyReq.removeHeader('Origin');
@@ -84,9 +82,8 @@ const commonOptions = {
         const contentType = (proxyRes.headers['content-type'] || '').toLowerCase();
         const statusCode = proxyRes.statusCode;
 
-        // --- A. HEADER CLEANUP ---
-        
-        // Fix Redirects (301/302)
+        // --- A. ALWAYS FIX HEADERS ---
+        // Fix redirects (Location header)
         if (proxyRes.headers['location']) {
             let redirect = proxyRes.headers['location'];
             redirect = redirect.replace(TARGET_MAIN, '')
@@ -95,7 +92,7 @@ const commonOptions = {
             res.setHeader('Location', redirect);
         }
 
-        // Remove blocking headers
+        // Remove blocking security headers
         const headersToDelete = ['content-security-policy', 'x-frame-options', 'content-length', 'transfer-encoding'];
         Object.keys(proxyRes.headers).forEach(key => {
             if (!headersToDelete.includes(key.toLowerCase())) {
@@ -103,17 +100,18 @@ const commonOptions = {
             }
         });
 
-        // --- B. THE INTELLIGENT SPLIT ---
+        // --- B. DECIDE: REWRITE OR STREAM? ---
+        // We MUST rewrite JS, JSON, and HTML to stop the redirect.
+        // We MUST STREAM Images/Fonts to keep it fast.
         
-        // WE REWRITE: HTML (Structure), JSON (Data), JS (Logic)
-        // WE STREAM: Images, Fonts, CSS, Video (Speed)
-        const isText = contentType.includes('text/') || 
-                       contentType.includes('javascript') || 
-                       contentType.includes('json') || 
-                       contentType.includes('xml');
+        const isCodeOrText = contentType.includes('text/') || 
+                             contentType.includes('javascript') || 
+                             contentType.includes('json') || 
+                             contentType.includes('xml') ||
+                             contentType.includes('application/x-javascript');
 
-        if (isText) {
-            // --- REWRITE MODE (Fixes the Magic Link) ---
+        if (isCodeOrText) {
+            // --- REWRITE MODE (The Fix) ---
             let originalBody = [];
             proxyRes.on('data', (chunk) => originalBody.push(chunk));
             
@@ -123,32 +121,33 @@ const commonOptions = {
                 const myHost = 'https://' + req.headers.host;
 
                 try {
-                    // 1. The "Rosetta Stone" Replacements
-                    // Replaces: https://www.pkmn.gg, https://pkmn.gg, https%3A%2F%2F...
-                    const targets = [TARGET_MAIN, TARGET_SOCKET, TARGET_NAKED];
-                    
-                    targets.forEach(target => {
-                        // Standard: https://pkmn.gg
-                        bodyString = bodyString.split(target).join(myHost);
-                        
-                        // Escaped: https:\/\/pkmn.gg (Common in JSON)
-                        const escapedTarget = target.replace('/', '\\/');
-                        const escapedHost = myHost.replace('/', '\\/');
-                        bodyString = bodyString.split(escapedTarget).join(escapedHost);
+                    // 1. REPLACEMENT: Main Targets
+                    const targets = [TARGET_MAIN, TARGET_NAKED, TARGET_SOCKET];
+                    targets.forEach(t => {
+                        bodyString = bodyString.split(t).join(myHost);
+                    });
 
-                        // Encoded: https%3A%2F%2Fpkmn.gg (Common in URL params)
-                        const encodedTarget = encodeURIComponent(target);
-                        const encodedHost = encodeURIComponent(myHost);
-                        bodyString = bodyString.split(encodedTarget).join(encodedHost);
+                    // 2. REPLACEMENT: JSON Escaped (https:\/\/...)
+                    const escapedHost = myHost.replace('/', '\\/');
+                    targets.forEach(t => {
+                        const escapedT = t.replace('/', '\\/');
+                        bodyString = bodyString.split(escapedT).join(escapedHost);
+                    });
+
+                    // 3. REPLACEMENT: URL Encoded (https%3A%2F%2F...)
+                    const encodedHost = encodeURIComponent(myHost);
+                    targets.forEach(t => {
+                        const encodedT = encodeURIComponent(t);
+                        bodyString = bodyString.split(encodedT).join(encodedHost);
                     });
 
                 } catch (e) {
-                    console.error("Rewrite Error:", e);
+                    console.error("Rewrite failed:", e);
                 }
 
-                // 2. Inject Script (Only into HTML)
+                // 4. INJECT IMPLANT (HTML Only)
+                // We inject in <head> to run before the site loads
                 if (contentType.includes('html')) {
-                    // Inject immediately after <head> to run before any other script
                     if (bodyString.includes('<head>')) {
                         bodyString = bodyString.replace('<head>', '<head>' + CLIENT_INJECTION);
                     } else {
@@ -162,8 +161,8 @@ const commonOptions = {
             });
 
         } else {
-            // --- STREAM MODE (Restores Speed) ---
-            // Images, Fonts, etc. pass through untouched
+            // --- STREAM MODE (The Speed) ---
+            // Pipe binary data (images, fonts, videos) instantly
             res.status(statusCode);
             proxyRes.pipe(res);
         }
@@ -172,13 +171,13 @@ const commonOptions = {
 
 // --- ROUTES ---
 
-// 1. Fix user habits
+// 1. Redirect old habits
 app.use((req, res, next) => {
     if (req.url.startsWith('/proxy')) return res.redirect('/');
     next();
 });
 
-// 2. Socket Proxy
+// 2. Socket Handler
 app.use('/socket.io', createProxyMiddleware({
     target: TARGET_SOCKET,
     changeOrigin: true,
@@ -186,7 +185,7 @@ app.use('/socket.io', createProxyMiddleware({
     onProxyReq: (proxyReq) => proxyReq.setHeader('Origin', TARGET_MAIN)
 }));
 
-// 3. Main Proxy
+// 3. Main Site Handler
 app.use('/', createProxyMiddleware(commonOptions));
 
-app.listen(PORT, () => console.log(`--- PROXY V10 (ARCHITECT) RUNNING ON ${PORT} ---`));
+app.listen(PORT, () => console.log(`--- PROXY V11 RUNNING ON ${PORT} ---`));
